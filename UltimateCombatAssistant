@@ -1,11 +1,11 @@
-/* global on sendChat getObj findObjs createObj Campaign playerIsGM */
+/* global on sendChat getObj findObjs createObj Campaign playerIsGM sendPing */
 
 var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany || (() => {
   'use strict';
 
   const SCRIPT = 'UltimateCombatAssistant by Zrujnowany';
   const STATE_KEY = 'UltimateCombatAssistantByZrujnowany';
-  const VERSION = '1.3.0';
+  const VERSION = '1.1.0';
 
   // ============================================================
   // CONDITIONS (bez Exhaustion)
@@ -221,7 +221,8 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
       effectsByToken: {}, // tokenId -> [{condKey, markerTag, rounds, isCustom}]
       lastTurnTokenId: null,
       lastTurnOrderHash: null,
-      turnNonce: 0
+      turnNonce: 0,
+      autocenterByPlayer: {}
     };
     return state[STATE_KEY];
   };
@@ -371,11 +372,54 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
     return ids.includes(playerid);
   };
 
+    // ============================================================
+    // AUTO-CENTER (per player) + global ping for everyone
+    // ============================================================
+    const isAutoCenterEnabledForPlayer = (playerid) => {
+      const st = getState();
+      st.autocenterByPlayer = st.autocenterByPlayer || {};
+      const v = st.autocenterByPlayer[playerid];
+      // domyślnie ON
+      return (v === undefined) ? true : !!v;
+    };
+    
+    const pingTokenToEveryone = (token) => {
+      try {
+        const pageid = token.get('_pageid');
+        const x = token.get('left');
+        const y = token.get('top');
+        // global ping -> każdy widzi znacznik
+        sendPing(x, y, pageid);
+      } catch (e) { /* ignore */ }
+    };
+    
+    const centerTokenForPlayers = (token, playerIds) => {
+      try {
+        const pageid = token.get('_pageid');
+        const x = token.get('left');
+        const y = token.get('top');
+    
+        (playerIds || []).forEach(pid => {
+          if (!pid) return;
+          // ping tylko do gracza + wymuszenie “przeskoku kamery”
+          // (to jest klucz do centrowania tylko wybranym)
+          sendPing(x, y, pageid, pid, true);
+        });
+      } catch (e) { /* ignore */ }
+    };
+    
+    const getAutoCenterTargetsForToken = (token) => {
+      // ignorujemy kontrolerów tokenu: centrować ma każdemu kto ma ON
+      return findObjs({ type: 'player' })
+        .filter(p => p && p.id)
+        .map(p => p.id)
+        .filter(pid => isAutoCenterEnabledForPlayer(pid));
+    };
   // ============================================================
   // STACKING UPSERT (for both built-in and custom)
   // same name -> overwrite only if new rounds > old
   // ============================================================
-  const upsertEffectWithStackRule = (token, condKey, rounds, markerTag, isCustom) => {
+  const upsertEffectWithStackRule = (token, condKey, rounds, markerTag, isCustom, note) => {
     const rNew = Math.max(1, parseInt(rounds, 10) || 1);
     const effects = getTokenEffects(token.id);
 
@@ -386,7 +430,14 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
 
       if (rNew > rOld) {
         const newTag = existing.markerTag || markerTag || null;
-        effects[idx] = { ...existing, rounds: rNew, markerTag: newTag, isCustom: !!existing.isCustom };
+        const noteNew = String(note || '').trim();
+            effects[idx] = {
+              ...existing,
+              rounds: rNew,
+              markerTag: newTag,
+              isCustom: !!existing.isCustom,
+              note: noteNew ? noteNew : (existing.note || '')
+            };
         setTokenEffects(token.id, effects);
         if (newTag) upsertMarkerCountdown(token, newTag, rNew);
         return { ok: true, didUpdate: true, stacked: true };
@@ -396,7 +447,13 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
     }
 
     const tag = markerTag || null;
-    effects.push({ condKey, markerTag: tag, rounds: rNew, isCustom: !!isCustom });
+    effects.push({
+      condKey,
+      markerTag: tag,
+      rounds: rNew,
+      isCustom: !!isCustom,
+      note: String(note || '').trim()
+    });
     setTokenEffects(token.id, effects);
     if (tag) upsertMarkerCountdown(token, tag, rNew);
     return { ok: true, didUpdate: true, stacked: false };
@@ -422,12 +479,13 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
     const whisperPrefix = (msg) => `/w "${getWhisperName(msg)}" `;
 
   // ---------- ADD CUSTOM EFFECT ----------
-  const addCustomEffect = (token, name, markerTag, rounds) => {
-    const safeName = String(name || '').trim().slice(0, 40) || 'Effect';
-    const tag = (markerTag && markerTag !== 'none') ? String(markerTag).trim() : null;
-
-    return upsertEffectWithStackRule(token, safeName, rounds, tag, true);
-  };
+    const addCustomEffect = (token, name, markerTag, rounds, note) => {
+      const safeName = String(name || '').trim().slice(0, 40) || 'Effect';
+      const tag = (markerTag && markerTag !== 'none') ? String(markerTag).trim() : null;
+      const safeNote = String(note || '').trim().slice(0, 200); // limit, żeby nie robić ściany tekstu
+    
+      return upsertEffectWithStackRule(token, safeName, rounds, tag, true, safeNote);
+    };
   
     const getConditionMarkerTagSet = () => {
       const s = new Set();
@@ -508,6 +566,13 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
       cond.reminders.forEach(r => lines.push({ condKey: e.condKey, text: r }));
     });
 
+    effects.forEach(e => {
+      const note = String(e.note || '').trim();
+      if (e.isCustom && note) {
+        lines.push({ condKey: e.condKey, text: note });
+      }
+    });
+
     const seen = new Set();
     return lines.filter(x => {
       const k = `${x.condKey}::${x.text}`;
@@ -520,7 +585,9 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
   // ============================================================
   // TURN PANEL (public)
   // ============================================================
-  const renderTurnPanel = (token) => {
+  const renderTurnPanel = (token, opts) => {
+    opts = opts || {};
+    const isShow = !!opts.isShow; // show panel (poza turą)
     const st = getState();
     const effects = getTokenEffects(token.id);
 
@@ -581,8 +648,12 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
       `
       : '';
 
-    const endBtn = `<a style="display:inline-block;padding:8px 10px;border:1px solid #3b3b3b;border-radius:10px;background:#202028;color:#fff;text-decoration:none;font-weight:900;"
+    const endBtn = isShow ? '' : `<a style="display:inline-block;padding:8px 10px;border:1px solid #3b3b3b;border-radius:10px;background:#202028;color:#fff;text-decoration:none;font-weight:900;"
       href="!uca --endturn --token ${token.id} --nonce ${st.turnNonce}">End Turn</a>`;
+
+    const addCustomBtn = `<a title="Add custom effect"
+      style="display:inline-block;padding:2px 8px;border:1px solid #2f5f2f;border-radius:8px;background:#1f3b1f;color:#d6ffd6;text-decoration:none;font-weight:900;font-size:14px;line-height:18px;"
+      href="!uca --custom --token ${token.id}">＋</a>`;
 
     const html = `
       <div style="background:#151515;border:1px solid #3b3b3b;border-radius:12px;padding:10px;max-width:640px;">
@@ -592,7 +663,7 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
               <img src="${img}" style="width:48px;height:48px;border-radius:10px;border:1px solid #3b3b3b;display:block;" />
             </td>
             <td style="vertical-align:top;">
-              <div style="font-size:16px;font-weight:900;color:#ffffff;line-height:1.15;margin-bottom:2px;">Turn: ${title}</div>
+              <div style="font-size:16px;font-weight:900;color:#ffffff;line-height:1.15;margin-bottom:2px;">${isShow ? '' : 'Turn: '}${title}</div>
               <div style="font-size:12px;color:#bdbdbd;">${SCRIPT} v${VERSION}</div>
             </td>
           </tr>
@@ -600,20 +671,30 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
 
         <div style="height:1px;background:#2f2f2f;margin:10px 0 8px 0;"></div>
 
-        <div style="font-size:12px;color:#bdbdbd;margin-bottom:6px;font-weight:900;">Timed Effects</div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <div style="font-size:12px;color:#bdbdbd;font-weight:900;">Timed Effects</div>
+          <div>${addCustomBtn}</div>
+        </div>
         <table style="width:100%;border-collapse:collapse;font-size:12.5px;">
           ${rows}
         </table>
 
         ${reminderBlock}
 
-        <div style="height:1px;background:#2f2f2f;margin:10px 0 10px 0;"></div>
-
-        <div style="text-align:center;">${endBtn}</div>
+        ${isShow ? '' : `<div style="height:1px;background:#2f2f2f;margin:10px 0 10px 0;"></div>
+        <div style="text-align:center;">${endBtn}</div>`}
       </div>
     `;
 
-    sendChat('Combat', `/direct ${oneLine(html)}`);
+    const out = oneLine(html);
+
+    if (opts && Array.isArray(opts.whisperTargets) && opts.whisperTargets.length) {
+      opts.whisperTargets.forEach(prefix => {
+        sendChat('UltimateCombatAssistant', `${prefix}${out}`);
+      });
+    } else {
+      sendChat('UltimateCombatAssistant', `/direct ${out}`);
+    }
   };
 
   // ============================================================
@@ -627,6 +708,9 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
 
     const clearAllBtn = `<a style="display:inline-block;padding:6px 10px;border:1px solid #3b3b3b;border-radius:10px;background:#2a2020;color:#fff;text-decoration:none;font-weight:900;"
       href="!uca --clearall">Clear All</a>`;
+      
+    const startFightBtn = `<a style="display:inline-block;padding:6px 12px;border:1px solid #3b3b3b;border-radius:10px;background:#1f3b1f;color:#fff;text-decoration:none;font-weight:900;"
+      href="!uca --startfight">Start Fight</a>`;
 
     const rows = CONDITIONS.map(c => {
       const icon = markerUrlFor(c.markerName);
@@ -651,7 +735,10 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
       <div style="background:#151515;border:1px solid #3b3b3b;border-radius:12px;padding:10px;max-width:820px;">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
           <div style="font-size:16px;font-weight:900;color:#fff;">UltimateCombatAssistant — Conditions (GM)</div>
-          <div>${clearAllBtn}</div>
+          <div style="display:flex;gap:18px;align-items:center;">
+            ${startFightBtn}
+            ${clearAllBtn}
+          </div>
         </div>
         <div style="font-size:12px;color:#bdbdbd;margin:6px 0 10px 0;">
           Select token(s), then Apply (with rounds). Stacking: overwrites only if new duration is longer.
@@ -661,7 +748,7 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
         </table>
       </div>
     `;
-    sendChat('Combat', `/w gm ${oneLine(html)}`);
+    sendChat('UltimateCombatAssistant', `/w gm ${oneLine(html)}`);
   };
 
   const announceConditionApplied = (token, condKey, rounds, didUpdate) => {
@@ -683,7 +770,7 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
         ${note}
       </div>
     `;
-    sendChat('Combat', `/direct ${oneLine(html)}`);
+    sendChat('UltimateCombatAssistant', `/direct ${oneLine(html)}`);
   };
 
   // ============================================================
@@ -713,7 +800,15 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
     }
 
     st.lastTurnTokenId = currentToken.id;
-    renderTurnPanel(currentToken);
+    
+    // 1) globalny ping dla wszystkich (znacznik widoczny dla każdego)
+    pingTokenToEveryone(currentToken);
+    
+    // 2) centrowanie tylko dla tych co mają ON
+    const targets = getAutoCenterTargetsForToken(currentToken);
+    centerTokenForPlayers(currentToken, targets);
+    
+    renderTurnPanel(currentToken, { viewerPlayerId: null });
   };
 
   // ============================================================
@@ -734,6 +829,70 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
     });
     return out;
   };
+  
+    const cmdAutoCenter = (msg, args) => {
+      const st = getState();
+      st.autocenterByPlayer = st.autocenterByPlayer || {};
+    
+      let nextVal;
+      if (args.on) nextVal = true;
+      else if (args.off) nextVal = false;
+      else {
+        // --toggle albo brak -> toggle
+        const cur = isAutoCenterEnabledForPlayer(msg.playerid);
+        nextVal = !cur;
+      }
+    
+      st.autocenterByPlayer[msg.playerid] = !!nextVal;
+    
+      sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)}[UCA] Auto-center is now: <b>${nextVal ? 'ON' : 'OFF'}</b>.`);
+    };
+  
+    const cmdShow = (msg, args) => {
+      let token = null;
+    
+      const tokenIdFromArgs = String(args.token || '').trim();
+      if (tokenIdFromArgs) {
+        const t = getObj('graphic', tokenIdFromArgs);
+        if (t && t.get('subtype') === 'token') token = t;
+      } else {
+        const selected = getSelectedTokens(msg);
+        if (selected.length !== 1) {
+          sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)}Select exactly ONE token, then run <b>!uca --show</b>.`);
+          return;
+        }
+        token = selected[0];
+      }
+    
+      if (!token) return;
+    
+      if (!canPlayerControlToken(msg.playerid, token)) {
+        sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)}You don’t control this token.`);
+        return;
+      }
+    
+      // ZAWSZE tylko do osoby, która wywołała komendę (bez kopii do GM)
+      const uniqueTargets = [whisperPrefix(msg)];
+    
+      renderTurnPanel(token, {
+        isShow: true,
+        viewerPlayerId: msg.playerid,
+        whisperTargets: uniqueTargets
+      });
+    };
+  
+  const cmdStartFight = (msg) => {
+      if (!playerIsGM(msg.playerid)) return;
+    
+      const cur = getCurrentTurnToken();
+      if (!cur) {
+        sendChat('UltimateCombatAssistant', `/w gm [UCA] Turn order is empty or current entry is invalid.`);
+        return;
+      }
+    
+      // pokaż panel tury dla aktualnego tokenu
+      renderTurnPanel(cur);
+    };
 
   const getSelectedTokens = (msg) => {
     const sel = msg.selected || [];
@@ -750,18 +909,18 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
 
     const tokenFromBtn = String(args.token || '').trim();
     if (!tokenFromBtn || tokenFromBtn !== cur.id) {
-      sendChat('Combat', `${whisperPrefix(msg)} This End Turn button is no longer valid.`);
+      sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)} This End Turn button is no longer valid.`);
       return;
     }
 
     const nonceFromBtn = parseInt(args.nonce, 10);
     if (!nonceFromBtn || nonceFromBtn !== st.turnNonce) {
-      sendChat('Combat', `${whisperPrefix(msg)} This End Turn button has expired.`);
+      sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)} This End Turn button has expired.`);
       return;
     }
 
     if (!canPlayerControlToken(msg.playerid, cur)) {
-      sendChat('Combat', `${whisperPrefix(msg)} You don’t control the current turn token.`);
+      sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)} You don’t control the current turn token.`);
       return;
     }
 
@@ -783,16 +942,34 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
     const rounds = args.rounds || '1';
     if (!cond) return;
 
-    const tokens = getSelectedTokens(msg);
+    let tokens = [];
+    
+    const tokenIdFromArgs = String(args.token || '').trim();
+    if (tokenIdFromArgs) {
+      const t = getObj('graphic', tokenIdFromArgs);
+      if (t && t.get('subtype') === 'token') tokens = [t];
+    } else {
+      tokens = getSelectedTokens(msg);
+    }
+    
     if (!tokens.length) {
-      sendChat('Combat', `/w gm Select token(s), then Apply.`);
+      sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)}Select token(s) first, then run <b>!uca --custom</b>.`);
       return;
+    }
+    
+    // uprawnienia: GM zawsze, gracze tylko jeśli kontrolują WSZYSTKIE wskazane tokeny
+    if (!playerIsGM(msg.playerid)) {
+      const ok = tokens.every(t => canPlayerControlToken(msg.playerid, t));
+      if (!ok) {
+        sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)}You don’t control one or more of the target tokens.`);
+        return;
+      }
     }
 
     tokens.forEach(t => {
       const res = addEffect(t, cond, rounds);
       if (res.ok) announceConditionApplied(t, cond, rounds, res.didUpdate);
-      else sendChat('Combat', `/w gm ${res.msg}`);
+      else sendChat('UltimateCombatAssistant', `/w gm ${res.msg}`);
     });
 
     const cur = getCurrentTurnToken();
@@ -807,7 +984,7 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
 
     const tokens = getSelectedTokens(msg);
     if (!tokens.length) {
-      sendChat('Combat', `/w gm Select token(s), then Remove.`);
+      sendChat('UltimateCombatAssistant', `/w gm Select token(s), then Remove.`);
       return;
     }
 
@@ -827,7 +1004,7 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
     if (!token) return;
 
     if (!canPlayerControlToken(msg.playerid, token)) {
-      sendChat('Combat', `${whisperPrefix(msg)} You don’t control this token.`);
+      sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)} You don’t control this token.`);
       return;
     }
 
@@ -848,13 +1025,13 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
     if (!token) return;
 
     if (!canPlayerControlToken(msg.playerid, token)) {
-      sendChat('Combat', `${whisperPrefix(msg)} You don’t control this token.`);
+      sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)} You don’t control this token.`);
       return;
     }
 
     const res = setEffectDuration(token, cond, val);
     if (!res.ok) {
-      sendChat('Combat', `${whisperPrefix(msg)} ${res.msg || 'Failed.'}`);
+      sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)} ${res.msg || 'Failed.'}`);
       return;
     }
 
@@ -864,23 +1041,42 @@ var UltimateCombatAssistantByZrujnowany = UltimateCombatAssistantByZrujnowany ||
 
   // ---------- CUSTOM MENU (players + GM) ----------
 const cmdCustomMenu = (msg, args) => {
-  const tokens = getSelectedTokens(msg);
+  let tokens = [];
+
+  // 1) jeśli przyszło --token, to cel = TEN token (ignorujemy selekcję)
+  const tokenIdFromArgs = String(args.token || '').trim();
+  if (tokenIdFromArgs) {
+    const t = getObj('graphic', tokenIdFromArgs);
+    if (t && t.get('subtype') === 'token') tokens = [t];
+  } else {
+    // 2) fallback: selekcja
+    tokens = getSelectedTokens(msg);
+  }
+
   if (!tokens.length) {
-    sendChat('Combat', `${whisperPrefix(msg)}Select token(s) first, then run <b>!uca --custom</b>.`);
+    sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)}Select token(s) first, then run <b>!uca --custom</b>.`);
     return;
+  }
+
+  // uprawnienia: GM zawsze, gracze tylko jeśli kontrolują WSZYSTKIE targety
+  if (!playerIsGM(msg.playerid)) {
+    const ok = tokens.every(t => canPlayerControlToken(msg.playerid, t));
+    if (!ok) {
+      sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)}You don’t control one or more of the target tokens.`);
+      return;
+    }
   }
 
   const tokenIdsCsv = tokens.map(t => t.id).join(',');
 
-    const forbidden = getConditionMarkerTagSet();
-    
-    const markers = getMarkerCatalog()
-      .filter(m => m && m.tag && m.url) // tylko te z obrazkiem
-      .filter(m => !forbidden.has(String(m.tag))) // <-- usuń ikony głównych stanów
-      .slice()
-      .sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'en'));
+  const forbidden = getConditionMarkerTagSet();
+  const markers = getMarkerCatalog()
+    .filter(m => m && m.tag && m.url)
+    .filter(m => !forbidden.has(String(m.tag)))
+    .slice()
+    .sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'en'));
 
-  const pageSize = 18; // 3x6 (max 18 per page in chat card)
+  const pageSize = 18;
   const page = Math.max(1, parseInt(args.page || '1', 10) || 1);
   const pages = Math.max(1, Math.ceil(markers.length / pageSize));
   const p = Math.min(page, pages);
@@ -888,79 +1084,76 @@ const cmdCustomMenu = (msg, args) => {
   const slice = markers.slice((p - 1) * pageSize, (p - 1) * pageSize + pageSize);
 
   const mkCell = (m) => {
-    const tag = encodeURIComponent(m.tag);
-    const nameLbl = esc(String(m.name || m.tag));
-    const img = esc(m.url);
-
-    // 1 klik na ikonkę -> pyta o nazwę + rundy -> dodaje efekt na zaznaczone tokeny
-    const link = `!uca --addcustom --tokens ${tokenIdsCsv} --tag ${tag} --name ?{Effect name|} --rounds ?{Rounds|1}`;
-
-    return `
-      <td style="width:12.5%;padding:6px;text-align:center;vertical-align:top;">
-        <a href="${link}" style="text-decoration:none;display:inline-block;">
-          <img src="${img}" title="${nameLbl}"
-               style="width:26px;height:26px;border-radius:6px;border:1px solid #3b3b3b;display:block;margin:0 auto 4px auto;" />
-          <div style="font-size:10.5px;line-height:1.15;color:#d0d0d0;max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:0 auto;">
-            ${nameLbl}
+        const tag = encodeURIComponent(m.tag);
+        const nameLbl = esc(String(m.name || m.tag));
+        const img = esc(m.url);
+    
+        const link = `!uca --addcustom --tokens ${tokenIdsCsv} --tag ${tag} --name ?{Effect name|} --note ?{Optional description (blank=none)|} --rounds ?{Rounds|1}`;
+    
+        return `
+          <td style="width:12.5%;padding:6px;text-align:center;vertical-align:top;">
+            <a href="${link}" style="text-decoration:none;display:inline-block;">
+              <img src="${img}" title="${nameLbl}"
+                   style="width:26px;height:26px;border-radius:6px;border:1px solid #3b3b3b;display:block;margin:0 auto 4px auto;" />
+              <div style="font-size:10.5px;line-height:1.15;color:#d0d0d0;max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:0 auto;">
+                ${nameLbl}
+              </div>
+            </a>
+          </td>
+        `;
+      };
+    
+      const cols = 3;
+      const rows = [];
+      for (let i = 0; i < slice.length; i += cols) {
+        const rowCells = slice.slice(i, i + cols).map(mkCell).join('');
+        const missing = cols - slice.slice(i, i + cols).length;
+        const pad = missing > 0 ? '<td></td>'.repeat(missing) : '';
+        rows.push(`<tr>${rowCells}${pad}</tr>`);
+      }
+    
+      const noneLink = `!uca --addcustom --tokens ${tokenIdsCsv} --tag none --name ?{Effect name|} --note ?{Optional description (blank=none)|} --rounds ?{Rounds|1}`;
+    
+      const prevBtn = p > 1
+        ? `<a style="display:inline-block;padding:6px 10px;border:1px solid #3b3b3b;border-radius:10px;background:#202028;color:#fff;text-decoration:none;font-weight:900;"
+              href="!uca --custom ${tokenIdFromArgs ? `--token ${tokenIdFromArgs} ` : ''}--page ${p - 1}">◀ Prev</a>`
+        : `<span style="display:inline-block;padding:6px 10px;border:1px solid #333;border-radius:10px;background:#111;color:#666;font-weight:900;">◀ Prev</span>`;
+    
+      const nextBtn = p < pages
+        ? `<a style="display:inline-block;padding:6px 10px;border:1px solid #3b3b3b;border-radius:10px;background:#202028;color:#fff;text-decoration:none;font-weight:900;"
+              href="!uca --custom ${tokenIdFromArgs ? `--token ${tokenIdFromArgs} ` : ''}--page ${p + 1}">Next ▶</a>`
+        : `<span style="display:inline-block;padding:6px 10px;border:1px solid #333;border-radius:10px;background:#111;color:#666;font-weight:900;">Next ▶</span>`;
+    
+      const html = `
+        <div style="background:#151515;border:1px solid #3b3b3b;border-radius:12px;padding:10px;max-width:920px;">
+          <div style="font-size:14px;font-weight:900;color:#fff;margin-bottom:6px;">Add Custom Effect</div>
+          <div style="font-size:12px;color:#bdbdbd;margin-bottom:8px;">
+            Target: <b>${tokens.length}</b> token(s).<br>
+            Click an icon → you’ll be asked for effect name + rounds → it applies.
           </div>
-        </a>
-      </td>
-    `;
-  };
-
-  // Złóż tabelę 8 kolumn
-  const cols = 3;
-  const rows = [];
-  for (let i = 0; i < slice.length; i += cols) {
-    const rowCells = slice.slice(i, i + cols).map(mkCell).join('');
-    // dopełnij puste komórki
-    const missing = cols - slice.slice(i, i + cols).length;
-    const pad = missing > 0 ? '<td></td>'.repeat(missing) : '';
-    rows.push(`<tr>${rowCells}${pad}</tr>`);
-  }
-
-  const noneLink = `!uca --addcustom --tokens ${tokenIdsCsv} --tag none --name ?{Effect name|} --rounds ?{Rounds|1}`;
-
-  const prevBtn = p > 1
-    ? `<a style="display:inline-block;padding:6px 10px;border:1px solid #3b3b3b;border-radius:10px;background:#202028;color:#fff;text-decoration:none;font-weight:900;"
-          href="!uca --custom --page ${p - 1}">◀ Prev</a>`
-    : `<span style="display:inline-block;padding:6px 10px;border:1px solid #333;border-radius:10px;background:#111;color:#666;font-weight:900;">◀ Prev</span>`;
-
-  const nextBtn = p < pages
-    ? `<a style="display:inline-block;padding:6px 10px;border:1px solid #3b3b3b;border-radius:10px;background:#202028;color:#fff;text-decoration:none;font-weight:900;"
-          href="!uca --custom --page ${p + 1}">Next ▶</a>`
-    : `<span style="display:inline-block;padding:6px 10px;border:1px solid #333;border-radius:10px;background:#111;color:#666;font-weight:900;">Next ▶</span>`;
-
-  const html = `
-    <div style="background:#151515;border:1px solid #3b3b3b;border-radius:12px;padding:10px;max-width:920px;">
-      <div style="font-size:14px;font-weight:900;color:#fff;margin-bottom:6px;">Add Custom Effect</div>
-      <div style="font-size:12px;color:#bdbdbd;margin-bottom:8px;">
-        Target: <b>${tokens.length}</b> selected token(s).<br>
-        Click an icon → you’ll be asked for effect name + rounds → it applies.
-      </div>
-
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;">
-        <div style="font-size:12px;color:#bdbdbd;">Icon page <b>${p}</b>/<b>${pages}</b> (total: ${markers.length})</div>
-        <div style="display:flex;gap:8px;align-items:center;">
-          ${prevBtn}
-          ${nextBtn}
-          <a style="display:inline-block;padding:6px 10px;border:1px solid #3b3b3b;border-radius:10px;background:#2a2020;color:#fff;text-decoration:none;font-weight:900;"
-             href="${noneLink}">No Icon</a>
+    
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;">
+            <div style="font-size:12px;color:#bdbdbd;">Icon page <b>${p}</b>/<b>${pages}</b> (total: ${markers.length})</div>
+            <div style="display:flex;gap:8px;align-items:center;">
+              ${prevBtn}
+              ${nextBtn}
+              <a style="display:inline-block;padding:6px 10px;border:1px solid #3b3b3b;border-radius:10px;background:#2a2020;color:#fff;text-decoration:none;font-weight:900;"
+                 href="${noneLink}">No Icon</a>
+            </div>
+          </div>
+    
+          <table style="width:100%;border-collapse:collapse;">
+            ${rows.join('')}
+          </table>
+    
+          <div style="margin-top:8px;font-size:11.5px;color:#777;">
+            Tip: If you have many markers, use Prev/Next.
+          </div>
         </div>
-      </div>
-
-      <table style="width:100%;border-collapse:collapse;">
-        ${rows.join('')}
-      </table>
-
-      <div style="margin-top:8px;font-size:11.5px;color:#777;">
-        Tip: If you have many markers, use Prev/Next.
-      </div>
-    </div>
-  `;
-
-  sendChat('Combat', `${whisperPrefix(msg)}${oneLine(html)}`);
-};
+      `;
+    
+      sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)}${oneLine(html)}`);
+    };
 
 
     const cmdAddCustom = (msg, args) => {
@@ -968,24 +1161,38 @@ const cmdCustomMenu = (msg, args) => {
       const name = String(args.name || '').trim();
       const tag = String(args.tag || '').trim();
       const rounds = String(args.rounds || '1').trim();
+      const note = String(args.note || '').trim();
     
       if (!tokensCsv) return;
     
       const tokenIds = tokensCsv.split(',').map(s => s.trim()).filter(Boolean);
       if (!tokenIds.length) return;
     
-      tokenIds.forEach(tid => {
-        const token = getObj('graphic', tid);
-        if (!token) return;
+      // Pobierz tokeny i odfiltruj nieistniejące
+      const tokens = tokenIds
+        .map(tid => getObj('graphic', tid))
+        .filter(t => t && t.get('subtype') === 'token');
     
-        addCustomEffect(token, name, tag, rounds);
+      if (!tokens.length) return;
+    
+      // Uprawnienia: GM zawsze; gracz tylko jeśli kontroluje WSZYSTKIE targety
+      if (!playerIsGM(msg.playerid)) {
+        const ok = tokens.every(t => canPlayerControlToken(msg.playerid, t));
+        if (!ok) {
+          sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)}You don’t control one or more of the target tokens.`);
+          return;
+        }
+      }
+    
+      // Apply
+      tokens.forEach(token => {
+        addCustomEffect(token, name, tag, rounds, note);
     
         const cur = getCurrentTurnToken();
         if (cur && cur.id === token.id) renderTurnPanel(cur);
       });
     
-      // opcjonalny feedback do osoby klikającej
-      sendChat('Combat', `${whisperTo(msg.playerid)}[UCA] Custom effect added to ${tokenIds.length} token(s).`);
+      sendChat('UltimateCombatAssistant', `${whisperTo(msg.playerid)}[UCA] Custom effect added to ${tokens.length} token(s).`);
     };
 
   // ---------- CLEAR ALL (GM) ----------
@@ -1010,7 +1217,7 @@ const cmdCustomMenu = (msg, args) => {
     st.lastTurnOrderHash = null;
     st.turnNonce = (st.turnNonce || 0) + 1;
 
-    sendChat('Combat', `/w gm [UCA] Cleared all effects and cleared the entire turn order.`);
+    sendChat('UltimateCombatAssistant', `/w gm [UCA] Cleared all effects and cleared the entire turn order.`);
   };
 
   // ---------- PANEL ----------
@@ -1040,11 +1247,18 @@ const cmdCustomMenu = (msg, args) => {
     if (args.remove) return cmdRemove(msg, args);
     if (args.removeone) return cmdRemoveOne(msg, args);
     if (args.setduration) return cmdSetDuration(msg, args);
+    if (args.startfight) return cmdStartFight(msg);
+    if (args.show) return cmdShow(msg, args);
+    if (args.autocenter) return cmdAutoCenter(msg, args);
 
-    sendChat('Combat', `${whisperPrefix(msg)} <div style="background:#111;border:1px solid #444;padding:8px;border-radius:8px;">
+    sendChat('UltimateCombatAssistant', `${whisperPrefix(msg)} <div style="background:#111;border:1px solid #444;padding:8px;border-radius:8px;">
       <b>${SCRIPT} v${VERSION}</b><br><br>
       <b>!uca --panel</b> — GM conditions panel<br>
       <b>!uca --custom</b> — custom timed effect (GM: multi-select OK, Players: 1 controlled token)<br>
+      <b>!uca --show</b> — show your panel outside your turn (no End Turn)
+      <b>!uca --autocenter --on</b> — enable auto-center for you<br>
+      <b>!uca --autocenter --off</b> — disable auto-center for you<br>
+      <b>!uca --autocenter</b> / <b>!uca --autocenter --toggle</b> — toggle auto-center<br>
       <b>⚙️</b> on turn panel — edit duration (0 removes)<br>
     </div>`);
   };
@@ -1054,7 +1268,7 @@ const cmdCustomMenu = (msg, args) => {
   const checkInstall = () => {
     const st = getState();
     st.version = VERSION;
-    sendChat('Combat', `/w gm ${SCRIPT} v${VERSION} ready. GM command: !uca --panel`);
+    sendChat('UltimateCombatAssistant', `/w gm ${SCRIPT} v${VERSION} ready. GM command: !uca --panel`);
   };
 
   const register = () => {
